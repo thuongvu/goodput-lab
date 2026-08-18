@@ -1,0 +1,12 @@
+image:
+  tag: vastai/vllm:v0.27.1-cuda-12.9
+  digest: sha256:FILL_AFTER_FIRST_PULL
+  vllm_version: "0.27.1"
+  cuda: "12.9"
+
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: null
+  dtype: bfloat16
+  # See model.max_model_len in RUNBOOK.md
+  max_model_len: null
