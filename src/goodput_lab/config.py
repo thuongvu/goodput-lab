@@ -22,6 +22,28 @@ def load_pin(path: Path | None = None) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def write_max_model_len(path: Path, value: int) -> None:
+    """Set model.max_model_len in pin.yaml. Other keys and comments stay."""
+    p = Path(path)
+    lines = p.read_text().splitlines(keepends=True)
+    found = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("max_model_len:"):
+            indent = line[: len(line) - len(stripped)]
+            newline = "\n" if line.endswith("\n") else ""
+            out.append(
+                "{}max_model_len: {}{}".format(indent, int(value), newline)
+            )
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        raise ValueError("no max_model_len key in {}".format(p))
+    p.write_text("".join(out))
+
+
 def _env(value: Any) -> str:
     """Flatten a YAML scalar to a shell string. None -> empty (same as KEY=)."""
     if value is None:

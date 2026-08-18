@@ -3,10 +3,16 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
-from goodput_lab.config import DEFAULT_PIN_PATH, load_pin, shell_exports
+from goodput_lab.config import (
+    DEFAULT_PIN_PATH,
+    load_pin,
+    shell_exports,
+    write_max_model_len,
+)
 
 
 class TestLoadPin(unittest.TestCase):
@@ -46,6 +52,39 @@ class TestLoadPin(unittest.TestCase):
         self.assertEqual(DEFAULT_PIN_PATH.parent.name, "config")
         self.assertFalse((Path(DEFAULT_PIN_PATH).parent / "freeze.txt").exists())
         self.assertFalse((Path(DEFAULT_PIN_PATH).parent / "image.txt").exists())
+
+
+class TestWriteMaxModelLen(unittest.TestCase):
+    """write_max_model_len updates a pin.yaml copy in place."""
+
+    def test_write_max_model_len_sets_key(self) -> None:
+        """Copy pin.yaml, write 8192, assert the key and other fields stay."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pin.yaml"
+            path.write_text(DEFAULT_PIN_PATH.read_text())
+            write_max_model_len(path, 8192)
+            data = load_pin(path)
+            self.assertEqual(data["model"]["max_model_len"], 8192)
+            self.assertEqual(data["model"]["name"], "Qwen/Qwen2.5-7B-Instruct")
+            self.assertEqual(data["model"]["dtype"], "bfloat16")
+            self.assertEqual(
+                data["image"]["tag"], "vastai/vllm:v0.27.1-cuda-12.9"
+            )
+            self.assertIn(
+                "# See model.max_model_len in RUNBOOK.md", path.read_text()
+            )
+
+    def test_write_max_model_len_overwrites_existing(self) -> None:
+        """A second write replaces the length without dropping other keys."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pin.yaml"
+            path.write_text(DEFAULT_PIN_PATH.read_text())
+            write_max_model_len(path, 4096)
+            write_max_model_len(path, 16384)
+            data = load_pin(path)
+            self.assertEqual(data["model"]["max_model_len"], 16384)
+            self.assertEqual(data["model"]["name"], "Qwen/Qwen2.5-7B-Instruct")
+            self.assertIsNone(data["model"]["revision"])
 
 
 if __name__ == "__main__":

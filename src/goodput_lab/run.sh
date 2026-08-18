@@ -8,6 +8,12 @@
 #   ./src/goodput_lab/run.sh --timed-trace src/goodput_lab/data/slice.jsonl
 #   ./src/goodput_lab/run.sh --mode discover --timed-trace src/goodput_lab/data/slice.jsonl
 #   ./src/goodput_lab/run.sh --mode loaded --timed-trace ... --repeat 3
+#   ./src/goodput_lab/run.sh --fit-max-model-len
+#   ./src/goodput_lab/run.sh --download-model
+#
+# Every invoke downloads MODEL (cached if HF_HOME already has it). Empty pin
+# max_model_len auto-searches before serve. --fit-max-model-len searches even
+# if the pin already has a length.
 #
 # Boot is not data. --num-warmups is always set.
 set -euo pipefail
@@ -26,6 +32,7 @@ CHUNK_HASH_SIZE=16
 CLIENT_TASKSET="${CLIENT_TASKSET:-}"
 IDLE_TIMEOUT_S="${IDLE_TIMEOUT_S:-120}"
 READY_TIMEOUT_S="${READY_TIMEOUT_S:-600}"
+FIT_MAX_MODEL_LENS=(4096 8192 16384 32768)
 
 if [[ ! -f "${CONFIG}" ]]; then
   echo "missing pin config: ${CONFIG}" >&2
@@ -40,26 +47,28 @@ if [[ -z "${MODEL:-}" || -z "${DTYPE:-}" ]]; then
   echo "pin config must set model.name and model.dtype" >&2
   exit 2
 fi
-if [[ -z "${MAX_MODEL_LEN:-}" ]]; then
-  echo "MAX_MODEL_LEN unset. Choose L from GPU fit, write it in config/pin.yaml, then filter." >&2
-  exit 2
-fi
 REVISION="${REVISION:-}"
 
 MODE="loaded"
 TIMED_TRACE=""
 REPEAT=1
+FIT_MAX_MODEL_LEN=0
+DOWNLOAD_MODEL=0
 DIFF_ARGS=()
 
-# Print flags. --timed-trace is required; --mode defaults to loaded.
+# Print flags. --timed-trace is required for discover/loaded.
 usage() {
   cat <<EOF
 Usage: run.sh [--mode discover|loaded] --timed-trace JSONL [options]
+       run.sh --fit-max-model-len
+       run.sh --download-model
 
-  --mode MODE          discover|loaded (default: loaded)
-  --timed-trace JSONL  timed_trace jsonl (required)
-  --repeat N           N benches in one dir; wait idle between (loaded only)
-  --diff ARGS...       extra vllm serve flags (must be last)
+  --mode MODE              discover|loaded (default: loaded)
+  --timed-trace JSONL      timed_trace jsonl (required for discover/loaded)
+  --repeat N               N benches in one dir; wait idle between (loaded only)
+  --fit-max-model-len      search max_model_len; write pin; no bench unless also --timed-trace
+  --download-model         huggingface download of MODEL; then exit
+  --diff ARGS...           extra vllm serve flags (must be last)
 EOF
 }
 
@@ -68,6 +77,8 @@ while [[ $# -gt 0 ]]; do
     --mode) MODE="$2"; shift 2 ;;
     --timed-trace) TIMED_TRACE="$2"; shift 2 ;;
     --repeat) REPEAT="$2"; shift 2 ;;
+    --fit-max-model-len) FIT_MAX_MODEL_LEN=1; shift ;;
+    --download-model) DOWNLOAD_MODEL=1; shift ;;
     --diff) shift; DIFF_ARGS+=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
@@ -78,14 +89,53 @@ case "$MODE" in
   discover|loaded) ;;
   *) echo "unknown mode: $MODE" >&2; usage; exit 2 ;;
 esac
-if [[ -z "$TIMED_TRACE" || ! -f "$TIMED_TRACE" ]]; then
+if [[ "$DOWNLOAD_MODEL" -eq 1 ]]; then
+  if [[ -n "$TIMED_TRACE" || "$FIT_MAX_MODEL_LEN" -eq 1 || "$REPEAT" -gt 1 ]]; then
+    echo "--download-model does not combine with --timed-trace, --fit-max-model-len, or --repeat" >&2
+    exit 2
+  fi
+fi
+if [[ "$FIT_MAX_MODEL_LEN" -eq 1 && "$REPEAT" -gt 1 ]]; then
+  echo "--repeat does not apply to --fit-max-model-len" >&2
+  exit 2
+fi
+
+FIT_ONLY=0
+if [[ "$DOWNLOAD_MODEL" -eq 0 && -z "$TIMED_TRACE" ]]; then
+  if [[ "$FIT_MAX_MODEL_LEN" -eq 1 || -z "${MAX_MODEL_LEN:-}" ]]; then
+    FIT_ONLY=1
+  else
+    echo "--timed-trace JSONL required" >&2
+    exit 2
+  fi
+fi
+if [[ -n "$TIMED_TRACE" && ! -f "$TIMED_TRACE" ]]; then
   echo "--timed-trace JSONL required" >&2
   exit 2
 fi
-if [[ "$MODE" == "discover" && "$REPEAT" -gt 1 ]]; then
+if [[ -n "$TIMED_TRACE" && "$MODE" == "discover" && "$REPEAT" -gt 1 ]]; then
   echo "--repeat does not apply to discover" >&2
   exit 2
 fi
+
+# huggingface-cli download of pin MODEL into HF_HOME (or the default cache).
+download_model() {
+  local dest="${HF_HOME:-default Hugging Face cache}"
+  echo "downloading ${MODEL} to ${dest}"
+  local -a cmd=()
+  if command -v huggingface-cli >/dev/null 2>&1; then
+    cmd=(huggingface-cli download "$MODEL")
+  elif python3 -c "import huggingface_hub" >/dev/null 2>&1; then
+    cmd=(python3 -m huggingface_hub.commands.huggingface_cli download "$MODEL")
+  else
+    echo "missing huggingface-cli (huggingface_hub)" >&2
+    exit 2
+  fi
+  if [[ -n "${REVISION}" ]]; then
+    cmd+=(--revision "$REVISION")
+  fi
+  "${cmd[@]}"
+}
 
 # Fail if vllm or nvidia-smi is missing.
 preflight() {
@@ -109,6 +159,18 @@ new_run_dir() {
   git_head="uncommitted"
   git -C "$ROOT" rev-parse HEAD >/dev/null 2>&1 && git_head="$(git -C "$ROOT" rev-parse HEAD)"
   python3 -m goodput_lab.run_metadata "$dir" "$git_head" "$CHUNK_HASH_SIZE" "$MODE"
+  cp "${CONFIG}" "$dir/"
+  touch "${dir}/serve.log"
+  echo "$dir"
+}
+
+# Make runs/fit_<utc>_<id>/ for max_model_len search logs.
+new_fit_dir() {
+  local id utc dir
+  id="$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+  utc="$(date -u +%Y%m%dT%H%M%SZ)"
+  dir="${RUNS}/fit_${utc}_${id}"
+  mkdir -p "$dir"
   cp "${CONFIG}" "$dir/"
   touch "${dir}/serve.log"
   echo "$dir"
@@ -163,6 +225,19 @@ wait_ready() {
     fi
     if (( "$(date +%s)" - t0 >= READY_TIMEOUT_S )); then
       echo "timeout waiting for ${BASE_URL}/v1/models" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# Poll until /v1/models no longer answers after a serve stop.
+wait_port_free() {
+  local t0
+  t0="$(date +%s)"
+  while curl -fsS -m 2 "${BASE_URL}/v1/models" >/dev/null 2>&1; do
+    if (( "$(date +%s)" - t0 >= 30 )); then
+      echo "timeout waiting for ${BASE_URL} to free after serve stop" >&2
       return 1
     fi
     sleep 1
@@ -236,6 +311,69 @@ SERVE_PID=""
 SCRAPE_PID=""
 STOP_FILE=""
 
+# Stop the current vllm serve pid and wait until it is gone.
+kill_serve() {
+  if [[ -z "${SERVE_PID}" ]]; then
+    return 0
+  fi
+  if kill -0 "$SERVE_PID" 2>/dev/null; then
+    kill "$SERVE_PID" 2>/dev/null || true
+  fi
+  wait "$SERVE_PID" 2>/dev/null || true
+  SERVE_PID=""
+}
+
+# Write last successful search length into config/pin.yaml.
+write_fit_pin() {
+  local value="$1"
+  python3 -c 'from pathlib import Path; from goodput_lab.config import write_max_model_len; write_max_model_len(Path("'"${CONFIG}"'"), '"${value}"')'
+  echo "wrote model.max_model_len: ${value} to ${CONFIG}"
+}
+
+# Try FIT_MAX_MODEL_LENS in order. Stop at first failure after a success.
+search_max_model_len() {
+  local last_ok="" len ready_ec
+  RUN_DIR="$(new_fit_dir)"
+  echo "fit dir: $RUN_DIR"
+  for len in "${FIT_MAX_MODEL_LENS[@]}"; do
+    echo "fit: trying max_model_len=${len}"
+    if curl -fsS -m 2 "${BASE_URL}/v1/models" >/dev/null 2>&1; then
+      echo "${BASE_URL}/v1/models already answers; refuse to start (wrong occupant on the port)" >&2
+      if [[ -n "$last_ok" ]]; then
+        echo "fit: port still occupied; keeping ${last_ok}"
+        break
+      fi
+      return 1
+    fi
+    MAX_MODEL_LEN="$len"
+    set +e
+    start_server
+    ready_ec=$?
+    set -e
+    if [[ "$ready_ec" -eq 0 ]]; then
+      echo "fit: ${len} ready"
+      last_ok="$len"
+      kill_serve
+      if ! wait_port_free; then
+        echo "fit: port did not free; keeping ${last_ok}"
+        break
+      fi
+      continue
+    fi
+    kill_serve
+    wait_port_free || true
+    if [[ -z "$last_ok" ]]; then
+      echo "fit: ${len} did not come up; not writing model.max_model_len" >&2
+      MAX_MODEL_LEN=""
+      return 1
+    fi
+    echo "fit: ${len} did not come up; keeping ${last_ok}"
+    break
+  done
+  MAX_MODEL_LEN="$last_ok"
+  write_fit_pin "$last_ok"
+}
+
 # Stop scrape then serve on exit.
 cleanup() {
   local ec=$?
@@ -243,15 +381,31 @@ cleanup() {
     [[ -n "$STOP_FILE" ]] && touch "$STOP_FILE"
     wait "$SCRAPE_PID" 2>/dev/null || true
   fi
-  if [[ -n "${SERVE_PID}" ]] && kill -0 "$SERVE_PID" 2>/dev/null; then
-    kill "$SERVE_PID" 2>/dev/null || true
-    wait "$SERVE_PID" 2>/dev/null || true
-  fi
+  kill_serve
   exit "$ec"
 }
-trap cleanup EXIT
 
+download_model
+if [[ "$DOWNLOAD_MODEL" -eq 1 ]]; then
+  exit 0
+fi
+
+trap cleanup EXIT
 preflight
+
+if [[ "$FIT_MAX_MODEL_LEN" -eq 1 || -z "${MAX_MODEL_LEN:-}" ]]; then
+  search_max_model_len
+  if [[ "$FIT_ONLY" -eq 1 ]]; then
+    echo "done"
+    exit 0
+  fi
+fi
+
+if [[ -z "${MAX_MODEL_LEN:-}" ]]; then
+  echo "MAX_MODEL_LEN unset. Choose L from GPU fit, write it in config/pin.yaml, then filter." >&2
+  exit 2
+fi
+
 RUN_DIR="$(new_run_dir)"
 echo "run dir: $RUN_DIR"
 
