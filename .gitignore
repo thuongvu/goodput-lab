@@ -1,0 +1,15 @@
+docs/
+src/goodput_lab/data/*.csv
+p0/help_serve.txt
+p0/help_bench.txt
+p0/metrics_sample.txt
+p0/nvidia-smi.txt
+p0/reset_endpoints.txt
+p0/unloaded.json
+p0/native_rate.txt
+p0/native_rate.json
+p0/filter_report.txt
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
