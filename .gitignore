@@ -1,3 +1,4 @@
+.DS_Store
 docs/
 src/goodput_lab/data/*.csv
 p0/help_serve.txt
