@@ -118,19 +118,15 @@ if [[ -n "$TIMED_TRACE" && "$MODE" == "discover" && "$REPEAT" -gt 1 ]]; then
   exit 2
 fi
 
-# huggingface-cli download of pin MODEL into HF_HOME (or the default cache).
+# hf download of pin MODEL into HF_HOME (or the default cache).
 download_model() {
   local dest="${HF_HOME:-default Hugging Face cache}"
   echo "downloading ${MODEL} to ${dest}"
-  local -a cmd=()
-  if command -v huggingface-cli >/dev/null 2>&1; then
-    cmd=(huggingface-cli download "$MODEL")
-  elif python3 -c "import huggingface_hub" >/dev/null 2>&1; then
-    cmd=(python3 -m huggingface_hub.commands.huggingface_cli download "$MODEL")
-  else
-    echo "missing huggingface-cli (huggingface_hub)" >&2
+  if ! command -v hf >/dev/null 2>&1; then
+    echo "missing hf (huggingface_hub)" >&2
     exit 2
   fi
+  local -a cmd=(hf download "$MODEL")
   if [[ -n "${REVISION}" ]]; then
     cmd+=(--revision "$REVISION")
   fi
