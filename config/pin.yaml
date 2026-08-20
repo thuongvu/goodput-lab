@@ -9,4 +9,4 @@ model:
   revision: null
   dtype: bfloat16
   # See model.max_model_len in RUNBOOK.md
-  max_model_len: null
+  max_model_len: 32768
