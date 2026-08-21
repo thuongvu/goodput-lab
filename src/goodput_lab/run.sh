@@ -197,11 +197,11 @@ start_server() {
   wait_ready
 }
 
-# Background scrape of /metrics into the run dir until cleanup.
+# Background scrape of /metrics into the run dir until the stop file exists.
 start_scrape() {
   STOP_FILE="${RUN_DIR}/scrape.stop"
   rm -f "$STOP_FILE"
-  python3 "${SCRIPT_DIR}/scrape_metrics.py" \
+  python3 -m goodput_lab.metrics_jsonl \
     --url "${BASE_URL}/metrics" \
     --interval-ms "$SCRAPE_INTERVAL_MS" \
     --out "${RUN_DIR}/metrics.jsonl" \
@@ -264,7 +264,7 @@ wait_idle() {
 bench_once() {
   local result_name="$1"
   local timed_trace_count
-  timed_trace_count="$(python3 -m goodput_lab.n_match --count "$TIMED_TRACE")"
+  timed_trace_count="$(python3 -m goodput_lab.count_match --count "$TIMED_TRACE")"
   local -a cmd=(vllm bench serve
     --model "$MODEL"
     --dataset-name timed_trace
@@ -293,19 +293,31 @@ bench_once() {
   "${cmd[@]}"
 }
 
-# Require bench JSON; compare prompt counts to the timed-trace via n_match.
+# Require bench JSON; compare prompt counts to the timed-trace via count_match.
 check_bench_counts() {
   local bench_json="${RUN_DIR}/$1"
   if [[ ! -f "$bench_json" ]]; then
     echo "bench failed and no result JSON" >&2
     return 1
   fi
-  python3 -m goodput_lab.n_match "$TIMED_TRACE" "$bench_json"
+  python3 -m goodput_lab.count_match "$TIMED_TRACE" "$bench_json"
 }
 
 SERVE_PID=""
 SCRAPE_PID=""
 STOP_FILE=""
+
+# Touch scrape.stop and wait until the scrape pid has exited.
+stop_scrape() {
+  if [[ -z "${SCRAPE_PID}" ]]; then
+    return 0
+  fi
+  if [[ -n "$STOP_FILE" ]] && kill -0 "$SCRAPE_PID" 2>/dev/null; then
+    touch "$STOP_FILE"
+  fi
+  wait "$SCRAPE_PID" 2>/dev/null || true
+  SCRAPE_PID=""
+}
 
 # Stop the current vllm serve pid and wait until it is gone.
 kill_serve() {
@@ -373,10 +385,7 @@ search_max_model_len() {
 # Stop scrape then serve on exit.
 cleanup() {
   local ec=$?
-  if [[ -n "${SCRAPE_PID}" ]] && kill -0 "$SCRAPE_PID" 2>/dev/null; then
-    [[ -n "$STOP_FILE" ]] && touch "$STOP_FILE"
-    wait "$SCRAPE_PID" 2>/dev/null || true
-  fi
+  stop_scrape
   kill_serve
   exit "$ec"
 }
@@ -419,10 +428,8 @@ while [[ "$i" -le "$REPEAT" ]]; do
     if [[ "$i" -gt 1 ]]; then
       wait_idle
     fi
-    RESULT_NAME="rep_${i}.json"
-  else
-    RESULT_NAME="bench.json"
   fi
+  RESULT_NAME="bench.json"
   set +e
   bench_once "$RESULT_NAME"
   bench_ec=$?
@@ -431,6 +438,19 @@ while [[ "$i" -le "$REPEAT" ]]; do
     exit "$bench_ec"
   fi
   check_bench_counts "$RESULT_NAME"
+  if [[ "$REPEAT" -gt 1 ]]; then
+    cp "${RUN_DIR}/${RESULT_NAME}" "${RUN_DIR}/rep_${i}.json"
+  fi
   i=$((i + 1))
 done
+# Close metrics.jsonl before results so the last scrape line is complete.
+stop_scrape
+# One bench.json plus metrics.jsonl. Repeat copies make that join ambiguous.
+if [[ "$REPEAT" -gt 1 ]]; then
+  echo "skipping results.json; run dir has rep_*.json"
+else
+  python3 -m goodput_lab.results \
+    --run-dir "$RUN_DIR" \
+    --trace "$TIMED_TRACE"
+fi
 echo "done -> $RUN_DIR"
