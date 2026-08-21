@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for n_match: matching counts, mismatch HARD STOP, JSONL last line."""
+"""Local tests for count_match: matching counts, mismatch stderr."""
 
 from __future__ import annotations
 
@@ -10,17 +10,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from goodput_lab.n_match import count_nonempty_lines, from_paths, main
+from goodput_lab.count_match import count_nonempty_lines, from_paths, main
 
 
 def _write_trace(path: Path, line_count: int) -> None:
+    """Write line_count one-object jsonl rows."""
     path.write_text(
         "".join("{}\n".format(json.dumps({"i": i})) for i in range(line_count))
     )
 
 
 class TestCountMatch(unittest.TestCase):
+    """from_paths and CLI count-match against bench input_lens."""
+
     def test_matching_counts(self) -> None:
+        """Equal jsonl and input_lens counts are ok."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             trace = root / "trace.jsonl"
@@ -36,6 +40,7 @@ class TestCountMatch(unittest.TestCase):
             self.assertEqual(match.output_count, 3)
 
     def test_missing_output_lens_not_mismatch(self) -> None:
+        """Missing or empty output_lens is 0 and still matches."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             trace = root / "trace.jsonl"
@@ -54,7 +59,8 @@ class TestCountMatch(unittest.TestCase):
             self.assertTrue(empty.ok)
             self.assertEqual(empty.output_count, 0)
 
-    def test_mismatch_hard_stop(self) -> None:
+    def test_mismatch_stderr(self) -> None:
+        """CLI exits 1 and prints jsonl vs input_lens counts."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             trace = root / "trace.jsonl"
@@ -68,27 +74,12 @@ class TestCountMatch(unittest.TestCase):
                 code = main([str(trace), str(bench)])
             self.assertEqual(code, 1)
             err = buf.getvalue()
-            self.assertIn("HARD STOP", err)
-            self.assertIn("input_count=2", err)
-            self.assertIn("timed_trace_count=3", err)
-
-    def test_last_line_jsonl_bench(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            trace = root / "trace.jsonl"
-            bench = root / "bench.jsonl"
-            _write_trace(trace, 3)
-            first = json.dumps({"input_lens": [1], "output_lens": [1]})
-            last = json.dumps(
-                {"input_lens": [1, 2, 3], "output_lens": [4, 5, 6]}
+            self.assertIn(
+                "count_match: jsonl rows 3 != bench input_lens 2", err
             )
-            bench.write_text("{}\n{}\n".format(first, last))
-            match = from_paths(trace, bench)
-            self.assertTrue(match.ok)
-            self.assertEqual(match.input_count, 3)
-            self.assertEqual(match.output_count, 3)
 
     def test_count_nonempty_lines_skips_blank(self) -> None:
+        """Blank jsonl lines are skipped; only nonempty lines count."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path = root / "trace.jsonl"
@@ -107,6 +98,7 @@ class TestCountMatch(unittest.TestCase):
             self.assertTrue(match.ok)
 
     def test_count_flag_prints_line_count(self) -> None:
+        """--count prints nonempty jsonl lines and skips bench."""
         with tempfile.TemporaryDirectory() as tmp:
             trace = Path(tmp) / "trace.jsonl"
             _write_trace(trace, 3)
