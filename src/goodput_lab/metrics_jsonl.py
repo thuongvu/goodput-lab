@@ -236,7 +236,10 @@ def _lookup(scrape: Scrape, name: str) -> float | None:
 
 
 def _percentile(values: list[float], p: float) -> float | None:
-    """Linear-interpolated percentile of the given values (running count, KV fill). Empty -> None."""
+    """Percentile of the given values (running count, KV fill).
+
+    Rank is p/100 times (n-1). If that lands between two samples, blend them.
+    """
     if not values:
         return None
     ordered = sorted(values)
