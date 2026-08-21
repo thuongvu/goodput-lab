@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare timed_trace jsonl request count to vLLM bench input_lens / output_lens."""
+"""jsonl nonempty line count vs vLLM bench.json input_lens, so the later index join is 1:1."""
 
 from __future__ import annotations
 
@@ -12,12 +12,10 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class CountMatch:
-    """Counts from a timed_trace jsonl vs a bench result json.
+    """Counts from a timed-trace jsonl vs the vLLM ServeBenchmark dump (bench.json).
 
-    timed_trace_count: non-empty lines in the jsonl.
-    input_count: len of input_lens on the bench object.
-    output_count: len of output_lens on the bench object.
-    Missing or empty output_lens is output_count=0 and is not a mismatch.
+    timed_trace_count is nonempty jsonl lines. input_count is len(input_lens).
+    output_count is len(output_lens). Missing or empty output_lens is 0 and still matches.
     """
 
     timed_trace_count: int
@@ -26,6 +24,7 @@ class CountMatch:
 
     @property
     def ok(self) -> bool:
+        """True when input_lens (and nonempty output_lens) match the jsonl line count."""
         if self.input_count != self.timed_trace_count:
             return False
         if self.output_count and self.output_count != self.timed_trace_count:
@@ -34,13 +33,9 @@ class CountMatch:
 
 
 def from_paths(timed_trace: Path, bench: Path) -> CountMatch:
-    """Read timed_trace jsonl and bench json; return CountMatch counts.
-
-    timed_trace: local jsonl path; count is non-empty lines. bench: whole-file
-    JSON, or last non-empty line if that decode fails (JSONL).
-    """
+    """Read jsonl and bench.json; return line counts vs input_lens / output_lens."""
     timed_trace_count = count_nonempty_lines(timed_trace)
-    payload = _load_bench(bench)
+    payload = json.loads(bench.read_text())
     input_count = len(payload.get("input_lens") or [])
     output_count = len(payload.get("output_lens") or [])
     return CountMatch(
@@ -51,32 +46,16 @@ def from_paths(timed_trace: Path, bench: Path) -> CountMatch:
 
 
 def count_nonempty_lines(path: Path) -> int:
-    """Count non-empty lines in path (timed_trace jsonl)."""
+    """Count nonempty lines in the served jsonl. That count must match bench input_lens."""
     with path.open() as handle:
         return sum(1 for line in handle if line.strip())
 
 
-def _load_bench(path: Path) -> dict:
-    """Parse bench JSON. Whole file, or last non-empty line if that is JSONL."""
-    text = path.read_text()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        last = None
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                last = json.loads(line)
-        if last is None:
-            raise ValueError("empty bench {}".format(path))
-        return last
+# CLI
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """CLI: timed_trace jsonl path, then bench result json path.
-
-    --count prints the timed_trace nonempty line count and skips the bench.
-    """
+    """CLI: jsonl path, then bench.json. --count prints the jsonl line count and skips the bench."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--count",
@@ -95,7 +74,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Print count, or count-match OK / HARD STOP; nonzero on mismatch or empty bench."""
+    """Print count, or count-match OK. run.sh after bench; nonzero on mismatch."""
     args = parse_args(argv)
     if args.count:
         print(count_nonempty_lines(args.timed_trace))
@@ -103,12 +82,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         match = from_paths(args.timed_trace, args.bench)
     except ValueError as err:
-        print("HARD STOP: {}".format(err), file=sys.stderr)
+        print("count_match: {}".format(err), file=sys.stderr)
         return 1
     if not match.ok:
         print(
-            "HARD STOP: bench input_count={} output_count={} timed_trace_count={}".format(
-                match.input_count, match.output_count, match.timed_trace_count
+            "count_match: jsonl rows {} != bench input_lens {}".format(
+                match.timed_trace_count, match.input_count
             ),
             file=sys.stderr,
         )
