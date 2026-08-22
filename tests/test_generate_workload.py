@@ -12,10 +12,13 @@ from unittest.mock import patch
 
 from goodput_lab.generate_workload import (
     DECODE_SHAPE,
+    PREFILL_SHAPE,
     TIMED_TRACE_KEYS,
     Phase,
+    PrefillRole,
     decode_profile_rows,
     main,
+    prefill_blast_rows,
     write_jsonl,
 )
 from goodput_lab.count_match import count_nonempty_lines
@@ -145,29 +148,239 @@ class TestDecodeShape(unittest.TestCase):
         self.assertLess(DECODE_SHAPE.input_len_max, DECODE_SHAPE.output_len_min)
 
 
+class TestPrefillBlastRows(unittest.TestCase):
+    """prefill-blast rows are deterministic, role-tagged, and timed_trace-shaped."""
+
+    def test_seed_42_stable_row_count_and_roles(self) -> None:
+        """Fixed seed repeats; vLLM keys plus phase; decode_stream, long_prefill, and arrival_probe present."""
+        rows = prefill_blast_rows(42)
+        again = prefill_blast_rows(42)
+        self.assertEqual(rows, again)
+        other = prefill_blast_rows(43)
+        self.assertNotEqual(rows, other)
+        self.assertEqual(len(rows), 47)
+
+        timestamps = [row["timestamp"] for row in rows]
+        self.assertEqual(timestamps[0], 0.0)
+        self.assertEqual(timestamps, sorted(timestamps))
+
+        phases = {row["phase"] for row in rows}
+        self.assertEqual(
+            phases, {"decode_stream", "long_prefill", "arrival_probe"}
+        )
+        by_phase: dict[str, list[dict]] = {}
+        for row in rows:
+            self.assertEqual(set(row), set(TIMED_TRACE_KEYS) | {"phase"})
+            self.assertIn(
+                row["phase"],
+                ("decode_stream", "long_prefill", "arrival_probe"),
+            )
+            self.assertIsInstance(row["timestamp"], float)
+            self.assertIsInstance(row["input_length"], int)
+            self.assertIsInstance(row["output_length"], int)
+            self.assertIsInstance(row["hash_ids"], list)
+            by_phase.setdefault(row["phase"], []).append(row)
+        self.assertEqual(
+            len(by_phase["decode_stream"]), PREFILL_SHAPE.decode_stream_count
+        )
+        self.assertEqual(
+            len(by_phase["long_prefill"]), PREFILL_SHAPE.long_prefill_count
+        )
+        self.assertEqual(
+            len(by_phase["arrival_probe"]), PREFILL_SHAPE.arrival_probe_count
+        )
+
+        next_hash = 1
+        for row in rows:
+            expected = dummy_chunk_ids(
+                row["input_length"], CHUNK_HASH_SIZE, next_hash
+            )
+            self.assertEqual(row["hash_ids"], expected)
+            next_hash += len(expected)
+
+    def test_token_bands_per_role(self) -> None:
+        """decode_stream, long_prefill, and arrival_probe lengths stay in their calibration bands."""
+        rows = prefill_blast_rows(42)
+        for row in rows:
+            phase = row["phase"]
+            if phase == PrefillRole.DECODE_STREAM.value:
+                self.assertGreaterEqual(
+                    row["input_length"],
+                    PREFILL_SHAPE.decode_stream_input_len_min,
+                )
+                self.assertLessEqual(
+                    row["input_length"],
+                    PREFILL_SHAPE.decode_stream_input_len_max,
+                )
+                self.assertGreaterEqual(
+                    row["output_length"],
+                    PREFILL_SHAPE.decode_stream_output_len_min,
+                )
+                self.assertLessEqual(
+                    row["output_length"],
+                    PREFILL_SHAPE.decode_stream_output_len_max,
+                )
+            elif phase == PrefillRole.LONG_PREFILL.value:
+                self.assertGreaterEqual(
+                    row["input_length"],
+                    PREFILL_SHAPE.long_prefill_input_len_min,
+                )
+                self.assertLessEqual(
+                    row["input_length"],
+                    PREFILL_SHAPE.long_prefill_input_len_max,
+                )
+                self.assertEqual(
+                    row["output_length"], PREFILL_SHAPE.long_prefill_output_len
+                )
+            else:
+                self.assertEqual(phase, PrefillRole.ARRIVAL_PROBE.value)
+                self.assertGreaterEqual(
+                    row["input_length"],
+                    PREFILL_SHAPE.arrival_probe_input_len_min,
+                )
+                self.assertLessEqual(
+                    row["input_length"],
+                    PREFILL_SHAPE.arrival_probe_input_len_max,
+                )
+                self.assertGreaterEqual(
+                    row["output_length"],
+                    PREFILL_SHAPE.arrival_probe_output_len_min,
+                )
+                self.assertLessEqual(
+                    row["output_length"],
+                    PREFILL_SHAPE.arrival_probe_output_len_max,
+                )
+
+    def test_long_prefill_while_decode_stream_in_flight(self) -> None:
+        """decode_stream sends first; each long_prefill follows the last decode_stream send; arrival_probe spans the blasts."""
+        rows = prefill_blast_rows(42)
+        decode_stream_times = [
+            row["timestamp"]
+            for row in rows
+            if row["phase"] == "decode_stream"
+        ]
+        long_prefill_times = [
+            row["timestamp"]
+            for row in rows
+            if row["phase"] == "long_prefill"
+        ]
+        arrival_probe_times = [
+            row["timestamp"]
+            for row in rows
+            if row["phase"] == "arrival_probe"
+        ]
+        self.assertTrue(decode_stream_times)
+        self.assertTrue(long_prefill_times)
+        self.assertTrue(arrival_probe_times)
+        self.assertLess(max(decode_stream_times), min(long_prefill_times))
+        self.assertGreaterEqual(len(long_prefill_times), 2)
+        last_decode_stream = max(decode_stream_times)
+        delay = PREFILL_SHAPE.long_prefill_delay
+        gap = PREFILL_SHAPE.long_prefill_interarrival
+        for index, send in enumerate(long_prefill_times):
+            self.assertAlmostEqual(
+                send, last_decode_stream + delay + index * gap
+            )
+            self.assertTrue(
+                any(arrival < send for arrival in arrival_probe_times)
+            )
+            self.assertTrue(
+                any(arrival > send for arrival in arrival_probe_times)
+            )
+
+    def test_t0_min_decode_stream_outlives_last_long_prefill(self) -> None:
+        """Last long_prefill send is before a t=0 min-output decode_stream finishes.
+
+        Assumes ~12 ms/token decode. Generate length versus send time.
+        """
+        rows = prefill_blast_rows(42)
+        last_prefill = max(
+            row["timestamp"]
+            for row in rows
+            if row["phase"] == "long_prefill"
+        )
+        decode_duration = PREFILL_SHAPE.decode_stream_output_len_min * 0.012
+        self.assertLess(last_prefill, decode_duration)
+
+    def test_cli_writes_jsonl(self) -> None:
+        """CLI writes prefill-blast jsonl and returns 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "trace.jsonl"
+            buf = io.StringIO()
+            with patch("sys.stdout", buf):
+                code = main(
+                    [
+                        "--profile",
+                        "prefill-blast",
+                        "--seed",
+                        "42",
+                        "--out",
+                        str(out),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(out.is_file())
+            self.assertFalse(out.with_suffix(".meta.json").exists())
+            self.assertEqual(count_nonempty_lines(out), len(prefill_blast_rows(42)))
+            stdout = buf.getvalue()
+            self.assertIn("profile=prefill-blast", stdout)
+            self.assertIn("seed=42", stdout)
+            loaded = [
+                json.loads(line) for line in out.read_text().splitlines() if line
+            ]
+            self.assertEqual(
+                {row["phase"] for row in loaded},
+                {"decode_stream", "long_prefill", "arrival_probe"},
+            )
+
+
+class TestPrefillShape(unittest.TestCase):
+    """Prefill-blast length bands stay short decode_stream, fat long_prefill, tiny arrival_probe."""
+
+    def test_role_bands(self) -> None:
+        """decode_stream prompt is short vs its output; long_prefill prompt is large vs output 1; arrival_probe is tiny."""
+        self.assertLess(
+            PREFILL_SHAPE.decode_stream_input_len_max,
+            PREFILL_SHAPE.decode_stream_output_len_min,
+        )
+        self.assertGreater(
+            PREFILL_SHAPE.long_prefill_input_len_min,
+            PREFILL_SHAPE.decode_stream_input_len_max,
+        )
+        self.assertEqual(PREFILL_SHAPE.long_prefill_output_len, 1)
+        self.assertLess(
+            PREFILL_SHAPE.arrival_probe_input_len_max,
+            PREFILL_SHAPE.decode_stream_input_len_min,
+        )
+        self.assertLess(
+            PREFILL_SHAPE.arrival_probe_output_len_max,
+            PREFILL_SHAPE.decode_stream_output_len_min,
+        )
+
+    def test_prompt_plus_output_fits_max_model_len(self) -> None:
+        """Prompt plus output fits pin.yaml max_model_len 32768."""
+        rows = prefill_blast_rows(42)
+        for row in rows:
+            self.assertLessEqual(
+                row["input_length"] + row["output_length"], 32768
+            )
+
+
 class TestProfileNotYet(unittest.TestCase):
     """Unimplemented profiles exit nonzero with not yet."""
 
-    def test_prefill_blast_not_yet(self) -> None:
-        """prefill-blast exits nonzero and stderr contains not yet."""
-        self._assert_not_yet("prefill-blast")
-
     def test_ownership_not_yet(self) -> None:
         """ownership exits nonzero and stderr contains not yet."""
-        self._assert_not_yet("ownership")
-
-    def _assert_not_yet(self, profile: str) -> None:
-        """Run CLI for profile and require a not-yet error without writing jsonl."""
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "out.jsonl"
             buf = io.StringIO()
             with patch("sys.stderr", buf):
                 code = main(
-                    ["--profile", profile, "--seed", "1", "--out", str(out)]
+                    ["--profile", "ownership", "--seed", "1", "--out", str(out)]
                 )
             self.assertEqual(code, 1)
             self.assertIn("not yet", buf.getvalue())
-            self.assertIn(profile, buf.getvalue())
+            self.assertIn("ownership", buf.getvalue())
             self.assertFalse(out.exists())
 
 
