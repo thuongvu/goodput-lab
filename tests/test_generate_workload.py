@@ -32,7 +32,7 @@ class TestDecodeProfileRows(unittest.TestCase):
         self.assertEqual(rows, again)
         other = decode_profile_rows(43)
         self.assertNotEqual(rows, other)
-        self.assertGreater(len(rows), 0)
+        self.assertEqual(len(rows), 465)
 
         timestamps = [row["timestamp"] for row in rows]
         self.assertEqual(timestamps[0], 0.0)
@@ -109,7 +109,7 @@ class TestDecodeProfileRows(unittest.TestCase):
         rows = decode_profile_rows(42)
         self.assertEqual(DECODE_SHAPE.interarrival[Phase.HEALTHY], 2.0)
         self.assertEqual(DECODE_SHAPE.interarrival[Phase.BUSY], 0.5)
-        self.assertEqual(DECODE_SHAPE.interarrival[Phase.PRESSURE], 0.15)
+        self.assertEqual(DECODE_SHAPE.interarrival[Phase.PRESSURE], 0.08)
         self.assertEqual(DECODE_SHAPE.interarrival[Phase.RECOVERY], 2.0)
         by_phase: dict[str, list[dict]] = {}
         for row in rows:

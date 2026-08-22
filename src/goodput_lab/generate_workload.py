@@ -83,7 +83,7 @@ DECODE_SHAPE = DecodeShape(
     interarrival={
         Phase.HEALTHY: 2.0,
         Phase.BUSY: 0.5,
-        Phase.PRESSURE: 0.15,
+        Phase.PRESSURE: 0.08,
         Phase.RECOVERY: 2.0,
     },
 )
