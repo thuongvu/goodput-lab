@@ -146,10 +146,11 @@ class TestResultsFromRunDir(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir, trace = _write_fixture(Path(tmp))
             results = results_from_run_dir(run_dir, trace)
-            self.assertEqual(results.healthy.ttft_p50, 10.0)
-            self.assertEqual(results.healthy.window_stats.preemption_delta, 3.0)
-            self.assertIsNotNone(results.busy)
-            self.assertEqual(results.busy.ttft_p50, 100.0)
+            healthy = results.by_phase["healthy"]
+            self.assertEqual(healthy.ttft_p50, 10.0)
+            self.assertEqual(healthy.window_stats.preemption_delta, 3.0)
+            self.assertIn("busy", results.by_phase)
+            self.assertEqual(results.by_phase["busy"].ttft_p50, 100.0)
 
 
 class TestCli(unittest.TestCase):
@@ -242,7 +243,7 @@ class TestWriteResults(unittest.TestCase):
 
 
 class TestResultsFromRows(unittest.TestCase):
-    """Join ttfts/itls by phase; nest healthy stats on Results."""
+    """Join ttfts/itls by phase; nest stats on Results keyed by jsonl phase."""
 
     def test_healthy_percentiles_and_nested_busy(self) -> None:
         """Healthy TTFT/ITL nested under healthy; busy nested."""
@@ -266,17 +267,19 @@ class TestResultsFromRows(unittest.TestCase):
             _scrape(1_011_000, 8.0, 0.5, 5.0),
         ]
         results = _results_from_rows(rows, bench, scrapes)
-        self.assertEqual(results.healthy.ttft_p50, 10.0)
-        self.assertEqual(results.healthy.itl_p50, 2.0)
-        self.assertEqual(results.healthy.window_stats.preemption_delta, 3.0)
-        self.assertEqual(results.healthy.window_stats.running_median, 2.0)
-        self.assertAlmostEqual(results.healthy.window_stats.kv_median, 0.15)
-        self.assertIsNone(results.healthy.queue_time_p50)
-        self.assertIsNotNone(results.busy)
-        self.assertEqual(results.busy.ttft_p50, 100.0)
-        self.assertEqual(results.busy.window_stats.preemption_delta, 0.0)
-        self.assertIsNone(results.pressure)
-        self.assertIsNone(results.recovery)
+        healthy = results.by_phase["healthy"]
+        self.assertEqual(healthy.ttft_p50, 10.0)
+        self.assertEqual(healthy.itl_p50, 2.0)
+        self.assertEqual(healthy.window_stats.preemption_delta, 3.0)
+        self.assertEqual(healthy.window_stats.running_median, 2.0)
+        self.assertAlmostEqual(healthy.window_stats.kv_median, 0.15)
+        self.assertIsNone(healthy.queue_time_p50)
+        self.assertIn("busy", results.by_phase)
+        busy = results.by_phase["busy"]
+        self.assertEqual(busy.ttft_p50, 100.0)
+        self.assertEqual(busy.window_stats.preemption_delta, 0.0)
+        self.assertNotIn("pressure", results.by_phase)
+        self.assertNotIn("recovery", results.by_phase)
 
         payload = results.to_dict()
         self.assertNotIn("first_send_unix_ms", payload)
@@ -306,7 +309,7 @@ class TestResultsFromRows(unittest.TestCase):
             _scrape(1_020_000, 1.0, 0.1, 2.0),
         ]
         results = _results_from_rows(rows, bench, scrapes)
-        self.assertEqual(results.healthy.window_stats.running_median, 1.5)
+        self.assertEqual(results.by_phase["healthy"].window_stats.running_median, 1.5)
 
     def test_missing_duration_errors(self) -> None:
         """Missing bench duration raises ValueError."""
@@ -332,7 +335,7 @@ class TestResultsFromRows(unittest.TestCase):
             _scrape(first_send_ms + 10_000, 1.0, 0.1, 0.0),
         ]
         results = _results_from_rows(rows, bench, scrapes)
-        self.assertEqual(results.healthy.window_stats.running_median, 1.0)
+        self.assertEqual(results.by_phase["healthy"].window_stats.running_median, 1.0)
 
     def test_last_phase_window_excludes_cleanup(self) -> None:
         """Last phase ends when the last request finishes."""
@@ -355,10 +358,10 @@ class TestResultsFromRows(unittest.TestCase):
             _scrape(first_send_ms + 30_000, 50.0, 0.9, 99.0),
         ]
         results = _results_from_rows(rows, bench, scrapes)
-        self.assertIsNotNone(results.busy)
-        self.assertEqual(results.busy.window_stats.running_median, 8.0)
-        self.assertEqual(results.busy.window_stats.preemption_delta, 0.0)
-        self.assertNotEqual(results.busy.window_stats.running_median, 50.0)
+        busy = results.by_phase["busy"]
+        self.assertEqual(busy.window_stats.running_median, 8.0)
+        self.assertEqual(busy.window_stats.preemption_delta, 0.0)
+        self.assertNotEqual(busy.window_stats.running_median, 50.0)
 
     def test_last_phase_window_ignores_perf_counter_start_times(self) -> None:
         """Last phase uses jsonl timestamps; start_times are time.perf_counter() seconds.
@@ -385,10 +388,10 @@ class TestResultsFromRows(unittest.TestCase):
             _scrape(first_send_ms + 30_000, 50.0, 0.9, 99.0),
         ]
         results = _results_from_rows(rows, bench, scrapes)
-        self.assertIsNotNone(results.busy)
-        self.assertEqual(results.busy.window_stats.running_median, 8.0)
-        self.assertEqual(results.busy.window_stats.preemption_delta, 0.0)
-        self.assertNotEqual(results.busy.window_stats.running_median, 50.0)
+        busy = results.by_phase["busy"]
+        self.assertEqual(busy.window_stats.running_median, 8.0)
+        self.assertEqual(busy.window_stats.preemption_delta, 0.0)
+        self.assertNotEqual(busy.window_stats.running_median, 50.0)
 
     def test_empty_scrape_window_errors(self) -> None:
         """A phase with rows and an empty scrape window raises ValueError."""
@@ -464,7 +467,42 @@ class TestResultsFromRows(unittest.TestCase):
                 _bench(1),
                 [_scrape(1_000_000, 1.0), _scrape(1_010_000, 1.0)],
             )
-        self.assertIn("healthy", str(ctx.exception))
+        self.assertEqual(str(ctx.exception), "no healthy rows in trace")
+
+    def test_prefill_blast_phases_join_without_healthy(self) -> None:
+        """decode_stream, long_prefill, and arrival_probe join with no healthy rows."""
+        first_send_ms = 1_700_000_000_000
+        rows = [
+            _trace_row(0.0, 0, "decode_stream"),
+            _trace_row(0.125, 1, "arrival_probe"),
+            _trace_row(0.25, 2, "decode_stream"),
+            _trace_row(3.0, 3, "long_prefill"),
+        ]
+        bench = _bench(4, duration=10.0)
+        scrapes = [
+            _scrape(first_send_ms, 4.0, 0.2, 1.0),
+            _scrape(first_send_ms + 125, 5.0, 0.3, 1.0),
+            _scrape(first_send_ms + 250, 5.0, 0.3, 2.0),
+            _scrape(first_send_ms + 3_000, 6.0, 0.5, 4.0),
+            _scrape(first_send_ms + 10_000, 1.0, 0.1, 4.0),
+        ]
+        results = _results_from_rows(rows, bench, scrapes)
+        self.assertEqual(
+            set(results.by_phase),
+            {"decode_stream", "long_prefill", "arrival_probe"},
+        )
+        self.assertNotIn("healthy", results.by_phase)
+        payload = results.to_dict()
+        self.assertEqual(
+            set(payload),
+            {"decode_stream", "long_prefill", "arrival_probe"},
+        )
+        self.assertEqual(payload["decode_stream"]["ttft_p50"], 10.0)
+        self.assertEqual(payload["long_prefill"]["ttft_p50"], 10.0)
+        self.assertEqual(payload["arrival_probe"]["ttft_p50"], 10.0)
+        self.assertIn("running_median", payload["decode_stream"])
+        self.assertIn("kv_median", payload["decode_stream"])
+        self.assertIn("preemption_delta", payload["decode_stream"])
 
     def test_empty_trace(self) -> None:
         """Empty jsonl is an error."""

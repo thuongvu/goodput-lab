@@ -72,21 +72,11 @@ class PhaseStats:
 class Results:
     """Lab results.json as a record, with nested stats per phase."""
 
-    healthy: PhaseStats
-    busy: PhaseStats | None = None
-    pressure: PhaseStats | None = None
-    recovery: PhaseStats | None = None
+    by_phase: dict[str, PhaseStats]
 
     def to_dict(self) -> dict:
-        """Stats for each phase that has rows."""
-        payload = {"healthy": self.healthy.to_dict()}
-        if self.busy is not None:
-            payload["busy"] = self.busy.to_dict()
-        if self.pressure is not None:
-            payload["pressure"] = self.pressure.to_dict()
-        if self.recovery is not None:
-            payload["recovery"] = self.recovery.to_dict()
-        return payload
+        """Stats for each phase that has rows. Keys are the jsonl phase strings."""
+        return {name: stats.to_dict() for name, stats in self.by_phase.items()}
 
 
 # JOIN
@@ -107,26 +97,18 @@ def _results_from_rows(
 ) -> Results:
     """Join jsonl rows to bench latencies by index and metrics.jsonl by wall time."""
     _require_aligned(rows, bench)
+    phase_names = _phase_names(rows)
+    _require_healthy(phase_names)
     first_send = _first_send_unix_ms(scrapes, bench)
-    windows = _phase_windows(rows, bench)
-    stats_by_phase: dict[Phase, PhaseStats] = {}
-    for phase in Phase:
-        indices = _phase_indices(rows, phase)
-        if not indices:
-            continue
-        start, end = windows[phase.value]
-        stats_by_phase[phase] = _phase_stats(
+    windows = _phase_windows(rows, bench, phase_names)
+    by_phase: dict[str, PhaseStats] = {}
+    for name in phase_names:
+        indices = _phase_indices(rows, name)
+        start, end = windows[name]
+        by_phase[name] = _phase_stats(
             indices, bench, scrapes, first_send, start, end
         )
-    healthy = stats_by_phase.get(Phase.HEALTHY)
-    if healthy is None:
-        raise ValueError("no healthy rows in trace")
-    return Results(
-        healthy=healthy,
-        busy=stats_by_phase.get(Phase.BUSY),
-        pressure=stats_by_phase.get(Phase.PRESSURE),
-        recovery=stats_by_phase.get(Phase.RECOVERY),
-    )
+    return Results(by_phase=by_phase)
 
 
 def rows_from_timed_trace(path: Path) -> list[dict]:
@@ -202,53 +184,51 @@ def _last_running_unix_ms(scrapes: list[Scrape]) -> int:
 
 
 # PHASE WINDOWS
-# Each phase from its first send to the next phase's first send. Last phase ends when the last request finishes.
+# Each phase from its first send to when that phase's last request finishes.
+
+
+def _phase_names(rows: list[dict]) -> list[str]:
+    """Distinct jsonl phase tags in first-appearance order."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = _row_phase(row)
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _require_healthy(phase_names: list[str]) -> None:
+    """Ensures healthy rows exist when the trace uses healthy/busy/pressure/recovery tags."""
+    decode_phases = {phase.value for phase in Phase}
+    present = set(phase_names)
+    if present & decode_phases and "healthy" not in present:
+        raise ValueError("no healthy rows in trace")
 
 
 def _phase_windows(
-    rows: list[dict], bench: BenchResult
+    rows: list[dict], bench: BenchResult, phase_names: list[str]
 ) -> dict[str, tuple[float, float]]:
     """Scrape windows on the jsonl relative-second clock, half-open [start, end).
 
-    Each phase starts at its first send and ends at the next phase's first send; the last phase ends when the last request finishes.
+    Each phase starts at its first send and ends when that phase's last request finishes.
     """
-    starts: dict[str, float] = {}
-    for phase in Phase:
-        timestamps = [
-            float(row["timestamp"])
-            for row in rows
-            if _row_phase(row) == phase.value
-        ]
-        if timestamps:
-            starts[phase.value] = timestamps[0]
-    present = [phase for phase in Phase if phase.value in starts]
-    end_of_trace = _window_end_seconds(rows, bench)
     windows: dict[str, tuple[float, float]] = {}
-    for index, phase in enumerate(present):
-        start = starts[phase.value]
-        if index + 1 < len(present):
-            end = starts[present[index + 1].value]
-        else:
-            end = end_of_trace
-            if end <= start:
-                end = start + (1.0 / MILLISECONDS_PER_SECOND)
-        windows[phase.value] = (start, end)
+    for name in phase_names:
+        indices = _phase_indices(rows, name)
+        start = float(rows[indices[0]]["timestamp"])
+        last = indices[-1]
+        end = float(rows[last]["timestamp"]) + _request_duration(bench, last)
+        if end <= start:
+            end = start + (1.0 / MILLISECONDS_PER_SECOND)
+        windows[name] = (start, end)
     return windows
 
 
 def _row_phase(row: dict) -> str:
     """Intention tag on a jsonl row (phase)."""
     return row["phase"]
-
-
-def _window_end_seconds(rows: list[dict], bench: BenchResult) -> float:
-    """When the last request finishes: last jsonl send plus send-to-last-token time. Caps the last phase window.
-
-    Uses rows[last] timestamp, the same clock as other phase bounds. start_times
-    on this vLLM image are time.perf_counter() seconds.
-    """
-    last = len(rows) - 1
-    return float(rows[last]["timestamp"]) + _request_duration(bench, last)
 
 
 def _request_duration(bench: BenchResult, index: int) -> float:
@@ -266,10 +246,10 @@ def _request_duration(bench: BenchResult, index: int) -> float:
     return total
 
 
-def _phase_indices(rows: list[dict], phase: Phase) -> list[int]:
+def _phase_indices(rows: list[dict], phase: str) -> list[int]:
     """Row indexes tagged with this phase. Index join into bench arrays uses these."""
     return [
-        index for index, row in enumerate(rows) if _row_phase(row) == phase.value
+        index for index, row in enumerate(rows) if _row_phase(row) == phase
     ]
 
 
