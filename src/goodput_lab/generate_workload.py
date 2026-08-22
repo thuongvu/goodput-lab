@@ -108,7 +108,7 @@ DECODE_SHAPE = DecodeShape(
 
 
 # PREFILL SHAPE
-# Token bands and send schedule. Starting guess; retune after the first GPU call.
+# Token bands and send schedule. Probes pack onto the packed prefills.
 
 
 @dataclass(frozen=True)
@@ -140,11 +140,10 @@ class PrefillShape:
     arrival_probe_interarrival: float
 
 
-# Decode-stream prompt 96-192 is from the decode envelope. Min generate is
-# chosen so a t=0 stream outlives the last long_prefill send (~12 ms/token).
-# 8k-12k is a large prefill that fits 32k context; probes 16-32 in / 8-16 out
-# are tiny. 12 streams every 0.25 s, delay 0.5 s, then 3 prefills every 4 s;
-# 32 probes every 0.5 s from 0.125 s span the prefills.
+# Decode-stream generate is long enough that streams are still producing
+# tokens when the prefills land. Prefills are a large prompt with output
+# length 1 that fits 32k context. Arrival probes are tiny and packed onto
+# that prefill window at a 0.15 s send gap so new arrivals see the prefill.
 PREFILL_SHAPE = PrefillShape(
     decode_stream_input_len_min=96,
     decode_stream_input_len_max=192,
@@ -161,10 +160,10 @@ PREFILL_SHAPE = PrefillShape(
     decode_stream_interarrival=0.25,
     long_prefill_count=3,
     long_prefill_delay=0.5,
-    long_prefill_interarrival=4.0,
+    long_prefill_interarrival=2.0,
     arrival_probe_count=32,
-    first_arrival_probe=0.125,
-    arrival_probe_interarrival=0.5,
+    first_arrival_probe=3.25,
+    arrival_probe_interarrival=0.15,
 )
 
 

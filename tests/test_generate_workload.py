@@ -252,7 +252,7 @@ class TestPrefillBlastRows(unittest.TestCase):
                 )
 
     def test_long_prefill_while_decode_stream_in_flight(self) -> None:
-        """decode_stream sends first; each long_prefill follows the last decode_stream send; arrival_probe spans the blasts."""
+        """decode_stream sends first; long_prefills follow; probes pack onto that window."""
         rows = prefill_blast_rows(42)
         decode_stream_times = [
             row["timestamp"]
@@ -281,12 +281,18 @@ class TestPrefillBlastRows(unittest.TestCase):
             self.assertAlmostEqual(
                 send, last_decode_stream + delay + index * gap
             )
-            self.assertTrue(
-                any(arrival < send for arrival in arrival_probe_times)
-            )
-            self.assertTrue(
-                any(arrival > send for arrival in arrival_probe_times)
-            )
+        self.assertEqual(long_prefill_times, [3.25, 5.25, 7.25])
+        self.assertAlmostEqual(arrival_probe_times[0], 3.25)
+        self.assertAlmostEqual(arrival_probe_times[-1], 7.90)
+        probe_gap = PREFILL_SHAPE.arrival_probe_interarrival
+        self.assertEqual(probe_gap, 0.15)
+        for previous, current in zip(
+            arrival_probe_times, arrival_probe_times[1:]
+        ):
+            self.assertAlmostEqual(current - previous, probe_gap)
+        for send in long_prefill_times:
+            self.assertLessEqual(min(arrival_probe_times), send)
+            self.assertGreater(max(arrival_probe_times), send)
 
     def test_t0_min_decode_stream_outlives_last_long_prefill(self) -> None:
         """Last long_prefill send is before a t=0 min-output decode_stream finishes.
@@ -336,6 +342,17 @@ class TestPrefillBlastRows(unittest.TestCase):
 
 class TestPrefillShape(unittest.TestCase):
     """Prefill-blast length bands stay short decode_stream, fat long_prefill, tiny arrival_probe."""
+
+    def test_probe_overlap_schedule(self) -> None:
+        """Probes start at the first long_prefill send; 0.15 s between arrival probes."""
+        self.assertEqual(PREFILL_SHAPE.decode_stream_count, 12)
+        self.assertEqual(PREFILL_SHAPE.decode_stream_interarrival, 0.25)
+        self.assertEqual(PREFILL_SHAPE.long_prefill_count, 3)
+        self.assertEqual(PREFILL_SHAPE.long_prefill_delay, 0.5)
+        self.assertEqual(PREFILL_SHAPE.long_prefill_interarrival, 2.0)
+        self.assertEqual(PREFILL_SHAPE.arrival_probe_count, 32)
+        self.assertEqual(PREFILL_SHAPE.first_arrival_probe, 3.25)
+        self.assertEqual(PREFILL_SHAPE.arrival_probe_interarrival, 0.15)
 
     def test_role_bands(self) -> None:
         """decode_stream prompt is short vs its output; long_prefill prompt is large vs output 1; arrival_probe is tiny."""
