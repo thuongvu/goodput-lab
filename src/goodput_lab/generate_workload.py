@@ -5,7 +5,8 @@ Each row is timestamp, input_length, output_length, hash_ids, and phase.
 Phase is an intention tag for a later `python3 -m goodput_lab.results` join.
 decode-envelope spaces sends by per-phase interarrival on the decode
 token-length envelope. prefill-blast schedules decode_stream, long_prefill,
-and arrival_probe rows.
+and arrival_probe rows. ownership writes those same rows; owners are serve
+settings passed on run.sh --diff.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from goodput_lab.timed_trace import CHUNK_HASH_SIZE, dummy_chunk_ids
 
 
 # PROFILES
-# Named workloads. decode-envelope and prefill-blast are implemented.
+# Named workloads.
 
 
 class Profile(enum.Enum):
@@ -37,8 +38,8 @@ class Profile(enum.Enum):
 # PHASES
 # Intention tags on generated jsonl rows for the results join.
 # decode-envelope: healthy/busy/pressure/recovery, constant interarrival
-# within a phase. prefill-blast: decode_stream/long_prefill/arrival_probe
-# on the same key.
+# within a phase. prefill-blast and ownership: decode_stream/long_prefill/
+# arrival_probe on the same key.
 
 
 class Phase(enum.Enum):
@@ -167,6 +168,61 @@ PREFILL_SHAPE = PrefillShape(
 )
 
 
+# OWNERSHIP SERVE
+# Same jsonl as prefill-blast. Owners are sequence cap, KV capacity, and
+# preemption. pin.yaml does not carry these knobs; run.sh --diff appends
+# them to vllm serve.
+
+
+@dataclass(frozen=True)
+class OwnershipServe:
+    """Intended vLLM serve flags for one owner. Human passes them on run.sh --diff."""
+
+    name: str
+    max_num_seqs: int | None
+    gpu_memory_utilization: float | None
+
+    def diff_argv(self) -> list[str]:
+        """Extra vllm serve tokens for run.sh --diff. Empty means stock serve."""
+        argv: list[str] = []
+        if self.max_num_seqs is not None:
+            argv.extend(["--max-num-seqs", str(self.max_num_seqs)])
+        if self.gpu_memory_utilization is not None:
+            argv.extend(
+                [
+                    "--gpu-memory-utilization",
+                    str(self.gpu_memory_utilization),
+                ]
+            )
+        return argv
+
+
+# sequence_cap: 8 is below the 12 in-flight decode streams so running can
+# glue at the cap. kv_capacity: stock serve. preemption: 0.45 is a starting
+# KV shrink; calibrate to the mildest gpu_memory_utilization that produces
+# a nonzero preemption delta.
+SEQUENCE_CAP_SERVE = OwnershipServe(
+    name="sequence_cap",
+    max_num_seqs=8,
+    gpu_memory_utilization=None,
+)
+KV_CAPACITY_SERVE = OwnershipServe(
+    name="kv_capacity",
+    max_num_seqs=None,
+    gpu_memory_utilization=None,
+)
+PREEMPTION_SERVE = OwnershipServe(
+    name="preemption",
+    max_num_seqs=None,
+    gpu_memory_utilization=0.45,
+)
+OWNERSHIP_SERVE = (
+    SEQUENCE_CAP_SERVE,
+    KV_CAPACITY_SERVE,
+    PREEMPTION_SERVE,
+)
+
+
 # GENERATE ROWS
 # Generate in-memory jsonl dicts.
 
@@ -285,6 +341,11 @@ def prefill_blast_rows(
     return rows
 
 
+def ownership_rows(seed: int, shape: PrefillShape = PREFILL_SHAPE) -> list[dict]:
+    """Same rows as prefill-blast. Owners are serve settings."""
+    return prefill_blast_rows(seed, shape)
+
+
 # WRITE JSONL
 # write_jsonl dumps one JSON object per line.
 
@@ -299,11 +360,11 @@ def write_jsonl(path: Path, rows: list[dict]) -> int:
 
 
 # CLI
-# --profile, --seed, --out. decode-envelope and prefill-blast write jsonl.
+# --profile, --seed, --out. ownership prints intended run.sh --diff lines.
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """CLI: --profile, --seed, --out. decode-envelope and prefill-blast write jsonl."""
+    """CLI: --profile, --seed, --out."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--profile",
@@ -313,6 +374,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--out", type=Path, required=True)
     return parser.parse_args(argv)
+
+
+def _print_ownership_serve() -> None:
+    """Print that rows match prefill-blast and the three intended run.sh --diff lines."""
+    print("same rows as prefill-blast; owners are serve settings")
+    for variant in OWNERSHIP_SERVE:
+        argv = variant.diff_argv()
+        if argv:
+            print("{}: --diff {}".format(variant.name, " ".join(argv)))
+        else:
+            print("{}: stock serve (no --diff)".format(variant.name))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -327,6 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         rows = decode_profile_rows(args.seed)
     elif profile == Profile.PREFILL_BLAST:
         rows = prefill_blast_rows(args.seed)
+    elif profile == Profile.OWNERSHIP:
+        rows = ownership_rows(args.seed)
     else:
         print("not yet: {}".format(profile.value), file=sys.stderr)
         return 1
@@ -340,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
             args.seed,
         )
     )
+    if profile == Profile.OWNERSHIP:
+        _print_ownership_serve()
     return 0
 
 

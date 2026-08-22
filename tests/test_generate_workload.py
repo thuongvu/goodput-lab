@@ -12,12 +12,18 @@ from unittest.mock import patch
 
 from goodput_lab.generate_workload import (
     DECODE_SHAPE,
+    KV_CAPACITY_SERVE,
+    OWNERSHIP_SERVE,
+    PREEMPTION_SERVE,
     PREFILL_SHAPE,
+    SEQUENCE_CAP_SERVE,
     TIMED_TRACE_KEYS,
+    OwnershipServe,
     Phase,
     PrefillRole,
     decode_profile_rows,
     main,
+    ownership_rows,
     prefill_blast_rows,
     write_jsonl,
 )
@@ -383,22 +389,70 @@ class TestPrefillShape(unittest.TestCase):
             )
 
 
-class TestProfileNotYet(unittest.TestCase):
-    """Unimplemented profiles exit nonzero with not yet."""
+class TestOwnershipRows(unittest.TestCase):
+    """ownership writes the same jsonl as prefill-blast; owners are serve settings."""
 
-    def test_ownership_not_yet(self) -> None:
-        """ownership exits nonzero and stderr contains not yet."""
+    def test_seed_42_matches_prefill_blast(self) -> None:
+        """Fixed seed repeats prefill-blast rows; vLLM keys plus phase."""
+        rows = ownership_rows(42)
+        self.assertEqual(rows, prefill_blast_rows(42))
+        self.assertEqual(len(rows), 47)
+        self.assertEqual(
+            {row["phase"] for row in rows},
+            {"decode_stream", "long_prefill", "arrival_probe"},
+        )
+        for row in rows:
+            self.assertEqual(set(row), set(TIMED_TRACE_KEYS) | {"phase"})
+
+    def test_cli_writes_jsonl_and_prints_serve_variants(self) -> None:
+        """CLI writes ownership jsonl and prints the three run.sh --diff lines."""
         with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp) / "out.jsonl"
+            out = Path(tmp) / "trace.jsonl"
             buf = io.StringIO()
-            with patch("sys.stderr", buf):
+            with patch("sys.stdout", buf):
                 code = main(
-                    ["--profile", "ownership", "--seed", "1", "--out", str(out)]
+                    [
+                        "--profile",
+                        "ownership",
+                        "--seed",
+                        "42",
+                        "--out",
+                        str(out),
+                    ]
                 )
-            self.assertEqual(code, 1)
-            self.assertIn("not yet", buf.getvalue())
-            self.assertIn("ownership", buf.getvalue())
-            self.assertFalse(out.exists())
+            self.assertEqual(code, 0)
+            self.assertTrue(out.is_file())
+            loaded = [
+                json.loads(line) for line in out.read_text().splitlines() if line
+            ]
+            self.assertEqual(loaded, prefill_blast_rows(42))
+            self.assertEqual(count_nonempty_lines(out), 47)
+            stdout = buf.getvalue()
+            self.assertIn("profile=ownership", stdout)
+            self.assertIn("seed=42", stdout)
+            self.assertIn("same rows as prefill-blast", stdout)
+            self.assertIn("sequence_cap: --diff --max-num-seqs 8", stdout)
+            self.assertIn("kv_capacity: stock serve (no --diff)", stdout)
+            self.assertIn(
+                "preemption: --diff --gpu-memory-utilization 0.45", stdout
+            )
+
+    def test_ownership_serve_diff_argv(self) -> None:
+        """Three owners: sequence cap, stock KV capacity, and a KV shrink for preemption."""
+        self.assertEqual(
+            [variant.name for variant in OWNERSHIP_SERVE],
+            ["sequence_cap", "kv_capacity", "preemption"],
+        )
+        self.assertEqual(SEQUENCE_CAP_SERVE.diff_argv(), ["--max-num-seqs", "8"])
+        self.assertEqual(KV_CAPACITY_SERVE.diff_argv(), [])
+        self.assertEqual(
+            PREEMPTION_SERVE.diff_argv(),
+            ["--gpu-memory-utilization", "0.45"],
+        )
+        self.assertIsInstance(SEQUENCE_CAP_SERVE, OwnershipServe)
+        self.assertIsNone(SEQUENCE_CAP_SERVE.gpu_memory_utilization)
+        self.assertIsNone(KV_CAPACITY_SERVE.max_num_seqs)
+        self.assertEqual(PREEMPTION_SERVE.gpu_memory_utilization, 0.45)
 
 
 if __name__ == "__main__":
