@@ -14,3 +14,6 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
+gateway/admission
+gateway/admission-linux-amd64
+gateway/gateway
