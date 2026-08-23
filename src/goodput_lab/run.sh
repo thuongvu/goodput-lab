@@ -26,6 +26,10 @@ RUNS="${ROOT}/runs"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 BASE_URL="${BASE_URL:-http://${HOST}:${PORT}}"
+# Bench OpenAI API. Defaults to HOST:PORT (vLLM). Set BENCH_PORT=8080 to hit the gateway.
+BENCH_HOST="${BENCH_HOST:-$HOST}"
+BENCH_PORT="${BENCH_PORT:-$PORT}"
+BENCH_URL="${BENCH_URL:-http://${BENCH_HOST}:${BENCH_PORT}}"
 SCRAPE_INTERVAL_MS="${SCRAPE_INTERVAL_MS:-200}"
 NUM_WARMUPS="${NUM_WARMUPS:-5}"
 CHUNK_HASH_SIZE=16
@@ -209,7 +213,8 @@ start_scrape() {
   SCRAPE_PID=$!
 }
 
-# Poll /v1/models until serve is up or READY_TIMEOUT_S.
+# Poll /v1/models until serve is up or READY_TIMEOUT_S. Always HOST:PORT (vLLM),
+# never BENCH_URL. An admission path would 503 and retry for READY_TIMEOUT_S.
 wait_ready() {
   local t0
   t0="$(date +%s)"
@@ -225,6 +230,29 @@ wait_ready() {
     fi
     sleep 1
   done
+}
+
+# Poll GET ${BENCH_URL}/metrics until the gateway answers. writeMetrics does
+# not contact upstream, so this is gateway liveness, not vLLM ready.
+wait_gateway_live() {
+  local t0
+  t0="$(date +%s)"
+  while true; do
+    curl -fsS -m 2 "${BENCH_URL}/metrics" >/dev/null 2>&1 && return 0
+    if (( "$(date +%s)" - t0 >= READY_TIMEOUT_S )); then
+      echo "timeout waiting for gateway ${BENCH_URL}/metrics (start the gateway)" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+# Fail if gateway_outstanding is not 0 after bench (wedged slot; discard the arm).
+check_gateway_drained() {
+  if [[ "$BENCH_HOST" == "$HOST" && "$BENCH_PORT" == "$PORT" ]]; then
+    return 0
+  fi
+  curl -fsS -m 2 "${BENCH_URL}/metrics" | python3 -m goodput_lab.gateway_outstanding
 }
 
 # Poll until /v1/models no longer answers after a serve stop.
@@ -276,10 +304,11 @@ bench_once() {
     --save-result
     --save-detailed
     --num-warmups "$NUM_WARMUPS"
+    --ready-check-timeout-sec 0
     --timed-trace-chunk-hash-size "$CHUNK_HASH_SIZE"
     --timed-trace-sec-multiplier 1  # jsonl timestamps already seconds
-    --host "$HOST"
-    --port "$PORT"
+    --host "$BENCH_HOST"
+    --port "$BENCH_PORT"
     --result-dir "$RUN_DIR"
     --result-filename "$result_name"
     --percentile-metrics ttft,tpot,itl,e2el
@@ -421,6 +450,11 @@ if ! kill -0 "$SCRAPE_PID" 2>/dev/null; then
   exit 1
 fi
 
+if [[ "$BENCH_HOST" != "$HOST" || "$BENCH_PORT" != "$PORT" ]]; then
+  echo "bench ${BENCH_URL} (serve remains ${BASE_URL}); wait GET ${BENCH_URL}/metrics"
+  wait_gateway_live
+fi
+
 i=1
 while [[ "$i" -le "$REPEAT" ]]; do
   if [[ "$REPEAT" -gt 1 ]]; then
@@ -438,6 +472,7 @@ while [[ "$i" -le "$REPEAT" ]]; do
     exit "$bench_ec"
   fi
   check_bench_counts "$RESULT_NAME"
+  check_gateway_drained
   if [[ "$REPEAT" -gt 1 ]]; then
     cp "${RUN_DIR}/${RESULT_NAME}" "${RUN_DIR}/rep_${i}.json"
   fi
